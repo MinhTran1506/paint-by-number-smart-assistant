@@ -1,0 +1,204 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Canvas viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1e1e1e;
+               font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #stage { position: absolute; inset: 0; overflow: hidden; cursor: grab;
+           touch-action: none; user-select: none; -webkit-user-select: none; }
+  #stage.drag { cursor: grabbing; }
+  #img { position: absolute; left: 0; top: 0; transform-origin: 0 0; max-width: none;
+         display: block; will-change: transform; -webkit-user-drag: none; }
+  #img.px { image-rendering: pixelated; }
+  #bar { position: absolute; top: 8px; right: 8px; display: flex; gap: 4px;
+         align-items: center; z-index: 2; }
+  #bar button { width: 30px; height: 30px; border: 0; border-radius: 6px; cursor: pointer;
+                background: rgba(255,255,255,.88); color: #222; font-size: 18px; line-height: 1; }
+  #bar button:hover { background: #fff; }
+  #zoom { min-width: 48px; text-align: center; font-size: 12px; color: #fff;
+          background: rgba(0,0,0,.55); border-radius: 6px; padding: 7px 6px; }
+  #hint { position: absolute; left: 8px; bottom: 8px; font-size: 11px; color: #fff;
+          background: rgba(0,0,0,.45); border-radius: 6px; padding: 4px 8px;
+          pointer-events: none; opacity: .85; }
+</style>
+</head>
+<body>
+<div id="stage"><img id="img" alt="" draggable="false"></div>
+<div id="bar">
+  <span id="zoom">100%</span>
+  <button id="zin" title="Zoom in">+</button>
+  <button id="zout" title="Zoom out">&minus;</button>
+  <button id="fit" title="Fit to view (or double-click)">&#x2922;</button>
+</div>
+<div id="hint">Scroll to zoom &middot; drag to pan &middot; click a region to select its color</div>
+<script>
+(function () {
+  const stage = document.getElementById("stage");
+  const img = document.getElementById("img");
+  const zoomLabel = document.getElementById("zoom");
+
+  let iw = 0, ih = 0;          // image size in its own pixels
+  let z = 1, tx = 0, ty = 0;   // current scale and translation (screen px)
+  let fit = 1, atFit = true;   // scale that fits the view, and whether we are still at it
+  let viewId = null, curSrc = null, frameHeight = null, clickN = 0, lastFocusN = null;
+
+  function send(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data), "*");
+  }
+
+  function apply() {
+    img.style.transform = "translate(" + tx + "px," + ty + "px) scale(" + z + ")";
+    img.classList.toggle("px", z > 3);
+    zoomLabel.textContent = Math.round((z / fit) * 100) + "%";
+  }
+
+  function clampPan() {
+    const W = stage.clientWidth, H = stage.clientHeight, w = iw * z, h = ih * z;
+    tx = w <= W ? (W - w) / 2 : Math.min(0, Math.max(W - w, tx));
+    ty = h <= H ? (H - h) / 2 : Math.min(0, Math.max(H - h, ty));
+  }
+
+  function computeFit() {
+    return Math.min(stage.clientWidth / iw, stage.clientHeight / ih) || 1;
+  }
+
+  function fitView() {
+    if (!iw) return;
+    fit = computeFit();
+    z = fit;
+    atFit = true;
+    clampPan();
+    apply();
+  }
+
+  function zoomAt(mx, my, factor) {
+    const nz = Math.min(fit * 16, Math.max(fit * 0.5, z * factor));
+    const k = nz / z;
+    tx = mx - (mx - tx) * k;
+    ty = my - (my - ty) * k;
+    z = nz;
+    atFit = Math.abs(z - fit) < 1e-6;
+    clampPan();
+    apply();
+  }
+
+  function zoomCenter(factor) {
+    zoomAt(stage.clientWidth / 2, stage.clientHeight / 2, factor);
+  }
+
+  // Centre on a region {x, y, w, h} (image pixels). Zoom in on small regions, zoom out just
+  // enough to show large ones, and keep the current zoom if the region already fits comfortably.
+  function focusOn(f) {
+    const W = stage.clientWidth, H = stage.clientHeight;
+    const w = Math.max(f.w, 1), h = Math.max(f.h, 1);
+    const m = Math.min(W / w, H / h);
+    const lower = Math.max(fit, Math.min(fit * 3, 0.8 * m));
+    const target = Math.min(fit * 16, Math.max(lower, 0.25 * m));
+    const comfortable = z >= fit * 3 && w * z <= 0.6 * W && h * z <= 0.6 * H;
+    if (!comfortable) z = target;
+    tx = W / 2 - f.x * z;
+    ty = H / 2 - f.y * z;
+    atFit = Math.abs(z - fit) < 1e-6;
+    clampPan();
+    apply();
+  }
+
+  stage.addEventListener("wheel", function (e) {
+    e.preventDefault();
+    const r = stage.getBoundingClientRect();
+    const dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;
+    zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-dy * 0.0015));
+  }, { passive: false });
+
+  let drag = null;
+  stage.addEventListener("pointerdown", function (e) {
+    if (e.button !== 0) return;
+    stage.setPointerCapture(e.pointerId);
+    drag = { x: e.clientX, y: e.clientY, tx: tx, ty: ty, moved: false };
+  });
+  stage.addEventListener("pointermove", function (e) {
+    if (!drag) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (!drag.moved && Math.hypot(dx, dy) < 4) return;  // small jitter still counts as a click
+    drag.moved = true;
+    stage.classList.add("drag");
+    tx = drag.tx + dx;
+    ty = drag.ty + dy;
+    atFit = false;
+    clampPan();
+    apply();
+  });
+  stage.addEventListener("pointerup", function (e) {
+    if (!drag) return;
+    const wasDrag = drag.moved;
+    drag = null;
+    stage.classList.remove("drag");
+    if (!wasDrag) clickAt(e);
+  });
+  stage.addEventListener("pointercancel", function () {
+    drag = null;
+    stage.classList.remove("drag");
+  });
+  stage.addEventListener("dblclick", fitView);
+
+  function clickAt(e) {
+    const r = stage.getBoundingClientRect();
+    const x = Math.floor((e.clientX - r.left - tx) / z);
+    const y = Math.floor((e.clientY - r.top - ty) / z);
+    if (x < 0 || y < 0 || x >= iw || y >= ih) return;
+    clickN += 1;
+    send("streamlit:setComponentValue",
+         { value: { x: x, y: y, n: clickN, view: viewId }, dataType: "json" });
+  }
+
+  document.getElementById("zin").addEventListener("click", function () { zoomCenter(1.5); });
+  document.getElementById("zout").addEventListener("click", function () { zoomCenter(1 / 1.5); });
+  document.getElementById("fit").addEventListener("click", fitView);
+
+  window.addEventListener("resize", function () {
+    if (!iw) return;
+    const oldFit = fit;
+    fit = computeFit();
+    if (atFit) { fitView(); return; }
+    z = Math.min(fit * 16, Math.max(fit * 0.5, z * (fit / oldFit)));
+    clampPan();
+    apply();
+  });
+
+  window.addEventListener("message", function (e) {
+    if (!e.data || e.data.type !== "streamlit:render") return;
+    const a = e.data.args || {};
+    if (a.height && a.height !== frameHeight) {
+      frameHeight = a.height;
+      send("streamlit:setFrameHeight", { height: a.height });
+    }
+    const newImage = a.img_w !== iw || a.img_h !== ih;
+    iw = a.img_w;
+    ih = a.img_h;
+    img.style.width = iw + "px";
+    img.style.height = ih + "px";
+    if (a.src !== curSrc) {  // a re-selection swaps the picture but keeps zoom and pan
+      curSrc = a.src;
+      img.src = a.src;
+    }
+    if (a.view_id !== viewId || newImage) {
+      viewId = a.view_id;
+      fitView();
+    } else if (atFit) {
+      fitView();
+    }
+    // A focus request is acted on once; later re-renders (e.g. after painting) leave the view alone.
+    if (a.focus && a.focus.n !== lastFocusN) {
+      lastFocusN = a.focus.n;
+      focusOn(a.focus);
+    }
+  });
+
+  send("streamlit:componentReady", { apiVersion: 1 });
+})();
+</script>
+</body>
+</html>
